@@ -1,0 +1,9 @@
+float32[] x0  # Request: an array of flattened initial states
+float32[] U   # Request: an array of flattened control actions over time
+int32 K  # Request: number of rollouts (depth)
+int32 T  # Request: number of time steps (rows)
+int32 M  # Request: number of control actions (col) 
+int32 N  # Request: number of states 
+float32 dT  # Request: integration time step
+---
+float32[] X   # Response: an array of flattened states over time
