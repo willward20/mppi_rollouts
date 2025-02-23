@@ -5,3 +5,4 @@ scripts/add_two_ints_client.py
 scripts/add_two_ints_server.py
 srv/AddNumbers.srv
 srv/AddTwoInts.srv
+.vscode

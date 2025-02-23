@@ -8,8 +8,11 @@ project(mppi_rollouts)
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED
+    roscpp
     rospy
     std_msgs
+    nav_msgs
+    tf
     message_generation
 )
 
@@ -47,11 +50,10 @@ find_package(catkin REQUIRED
 ##   * add every package in MSG_DEP_SET to generate_messages(DEPENDENCIES ...)
 
 ## Generate messages in the 'msg' folder
-# add_message_files(
-#   FILES
-#   Message1.msg
-#   Message2.msg
-# )
+add_message_files(
+  FILES
+  OdomProcessed.msg
+)
 
 ## Generate services in the 'srv' folder
 add_service_files(
@@ -108,7 +110,7 @@ catkin_package(
 #  LIBRARIES mppi_rollouts
 #  CATKIN_DEPENDS other_catkin_pkg
 #  DEPENDS system_lib
-    CATKIN_DEPENDS message_runtime
+    CATKIN_DEPENDS message_runtime roscpp std_msgs nav_msgs tf rospy
 )
 
 ###########
@@ -118,8 +120,8 @@ catkin_package(
 ## Specify additional locations of header files
 ## Your package locations should be listed before other locations
 include_directories(
-# include
-# ${catkin_INCLUDE_DIRS}
+  include
+  ${catkin_INCLUDE_DIRS}
 )
 
 ## Declare a C++ library
@@ -137,6 +139,10 @@ include_directories(
 ## The recommended prefix ensures that target names across packages don't collide
 # add_executable(${PROJECT_NAME}_node src/mppi_rollouts_node.cpp)
 
+# C++ code to convert /warty/odom messages to processed messages. 
+add_executable(odom_processor src/odom_processor.cpp)
+add_executable(talker src/talker.cpp)
+
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
 ## target back to the shorter version for ease of user use
@@ -146,11 +152,15 @@ include_directories(
 ## Add cmake target dependencies of the executable
 ## same as for the library above
 # add_dependencies(${PROJECT_NAME}_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+add_dependencies(odom_processor ${PROJECT_NAME}_generate_messages_cpp ${catkin_EXPORTED_TARGETS})
 
 ## Specify libraries to link a library or executable target against
-# target_link_libraries(${PROJECT_NAME}_node
-#   ${catkin_LIBRARIES}
-# )
+target_link_libraries(odom_processor
+  ${catkin_LIBRARIES}
+)
+target_link_libraries(talker
+  ${catkin_LIBRARIES}
+)
 
 #############
 ## Install ##
@@ -167,6 +177,7 @@ include_directories(
 #   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 # )
 
+# Python scripts for running/testing the MPPI rollouts server.
 catkin_install_python(PROGRAMS scripts/rollouts_server.py scripts/rollouts_client.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
