@@ -15,8 +15,8 @@ from FunctionEncoder import FunctionEncoder
 # Create a Function Encoder model. 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = FunctionEncoder(
-    input_size=(6,), # 1 del_time + 3 states + 2 actions
-    output_size=(3,), # 3 states
+    input_size=(4,),  # del_time, states (yaw), controls (lin x, ang z vel)
+    output_size=(3,), # next states (x, y, yaw)
     data_type="deterministic",
     n_basis=11,
     model_type="MLP",
@@ -26,29 +26,34 @@ model = FunctionEncoder(
 
 # Load pre-trained weights into the model. 
 path = f'{home}/FunctionEncoderMPPI/logs/warthog_example/least_squares/shared_model'
-model.load_state_dict(torch.load(f'{path}/2025-02-12_15-04-51/model.pth'))
+model.load_state_dict(torch.load(f'{path}/2025-03-03_12-31-48-WORKING-MODEL/model.pth'))
 
 # Load pre-collected CSV data to compute representations.
-csv_file = '/home/arl/catkin_ws/src/mppi_rollouts/data/warty-warthog_velocity_controller-odom-TRIMMED.csv'
-# Load CSV into a numpy array, then convert to torch tensor. 
+csv_file = '/home/arl/catkin_ws/src/mppi_rollouts/data/2025-02-28-10-58-11/warty-odom_processed-10hz-20.csv'
+# Load CSV into a numpy array. 
 array = np.loadtxt(csv_file, delimiter=',')
+# Unwrap the yaw meaurements.
+array[:, 3] = np.unwrap(array[:,3])
+# Convert numpy array to torch tensor. 
 tensor = torch.tensor(array, device=device).to(torch.float32)
 # Convert the time stamps column to changes in time. 
 tensor[:-1, 0] = tensor[1:, 0] - tensor[:-1, 0]
-# Get the "next" states from the data. 
-next_states = tensor[1:, 1:4]
+# Get the change in states from the data. 
+del_states = tensor[1:, 1:4] - tensor[:-1, 1:4]
 # Remove the bottom row from the data. 
 new_tensor = tensor[:-1,:]
-# Append the "next" states to the tensor. 
-data = torch.cat((new_tensor, next_states), dim=1)
+# Remove the xPos and yPos from the data.
+final_tensor = new_tensor[:,[0,3,4,5]]
+# Append the change in states to the tensor
+data = torch.cat((final_tensor, del_states), dim=1)
 
 # Get random indices from the data tensor.
 ex_indices = torch.randperm(data.size(0))[:1000]
 # Sample random rows from the data tensor. 
 ex_subset = data[ex_indices]
 # Parse out the input and output data.
-example_xs = ex_subset[:,:6].unsqueeze(dim=0)
-example_ys = ex_subset[:,6:].unsqueeze(dim=0)
+example_xs = ex_subset[:,:4].unsqueeze(dim=0)
+example_ys = ex_subset[:,4:].unsqueeze(dim=0)
 # Compute the coefficients for the function encoder using new data. 
 with torch.no_grad():
     coeff, _ = model.compute_representation(example_xs, example_ys, method="least_squares")
@@ -69,6 +74,7 @@ def handle_calc_rollouts(req):
             X = list encoder a (req.K, req.T+1. N) array. 
     """
     # print("[DEBUG]: Function Inputs") 
+    # print("dT: ", req.dT)
     # print("K: ", req.K)
     # print("T: ", req.T)
     # print("M: ", req.M)
@@ -126,7 +132,7 @@ def handle_calc_rollouts(req):
     # Integrate over time. 
     for i in range(req.T):
         # Concatenate all of the inputs.
-        input = torch.cat((time, X[:,:,i], V[:,:,i]), 0)
+        input = torch.cat((time, X[2,:,i].unsqueeze(0), V[:,:,i]), 0)
         # if i == 0:
             # print("[DEBUG]: Concatenated Input Tensor")
             # print("input: ", input)
@@ -142,14 +148,18 @@ def handle_calc_rollouts(req):
         # Predict the next state using the model. 
         with torch.no_grad():
             output = model.predict(input, coeff)
+            # output = bicycle(input)
             # if i == 0:
-                # print("[DEBUG]: Output Tensor")
-                # print("output: ", output)
-                # print("output: ", output.shape)
-                # print("output.squeeze(0).transpose(1,0): ", output.squeeze(0).transpose(1,0))
+            #     print("[DEBUG]: Output Tensor")
+            #     print("output: ", output)
+            #     print("output: ", output.shape)
+            #     print("output.squeeze(0).transpose(1,0): ", output.squeeze(0).transpose(1,0))
 
         # Assign the output as the next state. 
-        X[:,:,i+1] = (output.squeeze(0).transpose(1,0)).to("cpu")
+        # X[:,:,i+1] = (output.squeeze(0).transpose(1,0)).to("cpu")
+        
+        # Assign the output as the change in state. 
+        X[:,:,i+1] = X[:,:,i] + (output.squeeze(0).transpose(1,0))#.to("cpu")
         # if i == 0:
             # print("[DEBUG]: Assigning the output tensor to X")
             # print("X: ", X)
@@ -165,6 +175,27 @@ def handle_calc_rollouts(req):
     # print("X_flat: ", X_flat)
     # print("-----------------------")
     return MppiRolloutsResponse(X_flat)
+
+def bicycle(input):
+    """Same algorithm used in Phoenix to calculate skid_steer rollouts."""
+    inputT = input[0].transpose(0,1)
+    T, x, y, yaw, xvel, zvel = inputT
+    dx1 = (xvel*torch.cos(yaw)*T).unsqueeze(0)
+    dx2 = (xvel*torch.sin(yaw)*T).unsqueeze(0)
+    dx3 = (zvel*T).unsqueeze(0)
+    output = torch.cat((dx1,dx2,dx3), 0).transpose(1,0).unsqueeze(0)
+    return output  
+
+def dummy(input):
+    """Used to debug the rollouts. Let's you set change in states to constant."""
+    inputT = input[0].transpose(0,1)
+    T, x, y, yaw, xvel, zvel = inputT
+    dx1 = 0.0 + torch.zeros_like(x).unsqueeze(0)
+    dx2 = 0.0 + torch.zeros_like(x).unsqueeze(0)
+    dx3 = 2.0 + torch.zeros_like(x).unsqueeze(0)
+    output = torch.cat((dx1,dx2,dx3), 0).transpose(1,0).unsqueeze(0)
+    return output  
+
 
 if __name__ == "__main__":
     # Initialize the ROS server.
