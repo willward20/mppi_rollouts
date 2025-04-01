@@ -53,6 +53,7 @@ find_package(catkin REQUIRED
 add_message_files(
   FILES
   OdomProcessed.msg
+  OdomProcessedFull2D.msg
 )
 
 ## Generate services in the 'srv' folder
@@ -141,6 +142,7 @@ include_directories(
 
 # C++ code to convert /warty/odom messages to processed messages. 
 add_executable(odom_processor src/odom_processor.cpp)
+add_executable(odom_processor_full2D src/odom_processor_full2D.cpp)
 add_executable(talker src/talker.cpp)
 
 ## Rename C++ executable without prefix
@@ -156,6 +158,9 @@ add_dependencies(odom_processor ${PROJECT_NAME}_generate_messages_cpp ${catkin_E
 
 ## Specify libraries to link a library or executable target against
 target_link_libraries(odom_processor
+  ${catkin_LIBRARIES}
+)
+target_link_libraries(odom_processor_full2D
   ${catkin_LIBRARIES}
 )
 target_link_libraries(talker

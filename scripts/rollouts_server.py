@@ -5,59 +5,74 @@ import os
 import rospy
 import sys
 import torch
+import time as timepkg
 from mppi_rollouts.srv import MppiRollouts, MppiRolloutsResponse
+import matplotlib.pyplot as plt
+from sklearn.metrics.pairwise import rbf_kernel, polynomial_kernel, linear_kernel
+from functools import partial
 
 # Add path to the FunctionEncoder package.
 home = os.path.expanduser('~')
 sys.path.append(f'{home}/FunctionEncoderMPPI')
-from FunctionEncoder import FunctionEncoder
+from FunctionEncoder import FunctionEncoder, WarthogDataset, WarthogDatasetFull2D
+
+# create a dataset
+data_path = f"{home}/catkin_ws/src/mppi_rollouts/data/2025-03-22-10-35-47"
+odom_path = f"{data_path}/warty-odom_processed_full2D-20Hz-CLEAN.csv"
+cmdvel_path = f"{data_path}/warty-cmd_vel-CLEAN.csv"
+dataset = WarthogDatasetFull2D(
+    odom_csv = odom_path, 
+    cmdvel_csv = cmdvel_path,
+    n_examples = 1000
+)
 
 # Create a Function Encoder model. 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = FunctionEncoder(
-    input_size=(4,),  # del_time, states (yaw), controls (lin x, ang z vel)
-    output_size=(3,), # next states (x, y, yaw)
-    data_type="deterministic",
+    input_size=dataset.input_size,  # del_time, states (yaw), controls (lin x, ang z vel)
+    output_size=dataset.output_size, # next states (x, y, yaw)
+    data_type=dataset.data_type,
     n_basis=11,
-    model_type="MLP",
+    model_type="FE_NeuralODE",
     method="least_squares",
     use_residuals_method=False
 ).to(device)
 
 # Load pre-trained weights into the model. 
 path = f'{home}/FunctionEncoderMPPI/logs/warthog_example/least_squares/shared_model'
-model.load_state_dict(torch.load(f'{path}/2025-03-03_12-31-48-WORKING-MODEL/model.pth'))
+model.load_state_dict(torch.load(f'{path}/2025-04-01_15-26-52_FE_NeuralODE/model.pth'))
 
-# Load pre-collected CSV data to compute representations.
-csv_file = '/home/arl/catkin_ws/src/mppi_rollouts/data/2025-02-28-10-58-11/warty-odom_processed-10hz-20.csv'
-# Load CSV into a numpy array. 
-array = np.loadtxt(csv_file, delimiter=',')
-# Unwrap the yaw meaurements.
-array[:, 3] = np.unwrap(array[:,3])
-# Convert numpy array to torch tensor. 
-tensor = torch.tensor(array, device=device).to(torch.float32)
-# Convert the time stamps column to changes in time. 
-tensor[:-1, 0] = tensor[1:, 0] - tensor[:-1, 0]
-# Get the change in states from the data. 
-del_states = tensor[1:, 1:4] - tensor[:-1, 1:4]
-# Remove the bottom row from the data. 
-new_tensor = tensor[:-1,:]
-# Remove the xPos and yPos from the data.
-final_tensor = new_tensor[:,[0,3,4,5]]
-# Append the change in states to the tensor
-data = torch.cat((final_tensor, del_states), dim=1)
-
-# Get random indices from the data tensor.
-ex_indices = torch.randperm(data.size(0))[:1000]
-# Sample random rows from the data tensor. 
-ex_subset = data[ex_indices]
-# Parse out the input and output data.
-example_xs = ex_subset[:,:4].unsqueeze(dim=0)
-example_ys = ex_subset[:,4:].unsqueeze(dim=0)
+# Sample data
+example_xs, example_ys, _, _, _ = dataset.sample()
 # Compute the coefficients for the function encoder using new data. 
 with torch.no_grad():
     coeff, _ = model.compute_representation(example_xs, example_ys, method="least_squares")
 
+
+# New kernel stuff
+# train_data = dataset.train_data.cpu() # 90% of data
+# test_data = dataset.test_data.cpu() # 10% of data
+
+# X = train_data[:,:6]
+# Y = train_data[:,6:]
+
+# sigma = 0.2
+# gamma = 1/ (2 * sigma ** 2)
+# kernel = partial(rbf_kernel, gamma=gamma)
+# Gx = kernel(X, X)
+# G = Gx
+
+# G[np.diag_indices_from(G)] += 1e-6
+
+# G_inv = np.linalg.inv(G)
+
+# def ker_model(x):
+#     kx = kernel(X, x)
+
+#     k = kx
+
+#     pred = Y.T @ G_inv @ k
+#     return pred
 
 
 def handle_calc_rollouts(req):
@@ -131,8 +146,10 @@ def handle_calc_rollouts(req):
     
     # Integrate over time. 
     for i in range(req.T):
+        # Zero out the position and heading states in x0.
+        zeros = torch.zeros(3, X.shape[1], device=device)
         # Concatenate all of the inputs.
-        input = torch.cat((time, X[2,:,i].unsqueeze(0), V[:,:,i]), 0)
+        input = torch.cat((time, zeros, X[3:,:,i], V[:,:,i]), 0) # only use vels
         # if i == 0:
             # print("[DEBUG]: Concatenated Input Tensor")
             # print("input: ", input)
@@ -145,27 +162,65 @@ def handle_calc_rollouts(req):
             # print("input: ", input)
             # print("input: ", input.shape)
         
-        # Predict the next state using the model. 
+        # Predict the change in pose (expressed in the body frame) and
+        # the velocity of the next body frame. 
         with torch.no_grad():
             output = model.predict(input, coeff)
             # output = bicycle(input)
             # if i == 0:
             #     print("[DEBUG]: Output Tensor")
-            #     print("output: ", output)
+            #     print("output: ", output.shape)
             #     print("output: ", output.shape)
             #     print("output.squeeze(0).transpose(1,0): ", output.squeeze(0).transpose(1,0))
 
-        # Assign the output as the next state. 
-        # X[:,:,i+1] = (output.squeeze(0).transpose(1,0)).to("cpu")
+            # try using the kernel model
+            # output = ker_model(torch.cat((time, X[3:,:,i], V[:,:,i])).transpose(1,0).cpu()).cuda().transpose(1,0).unsqueeze(0)
+            # print("output: ", output.shape)
+
+        # Transform the change in pose from the initial body frame
+        # to the inertial frame.  
+        del_states_I = body_to_inertial(
+            X[:3,:,i].transpose(1,0), 
+            output.squeeze(0)[:,:3]
+        )
         
-        # Assign the output as the change in state. 
-        X[:,:,i+1] = X[:,:,i] + (output.squeeze(0).transpose(1,0))#.to("cpu")
-        # if i == 0:
-            # print("[DEBUG]: Assigning the output tensor to X")
-            # print("X: ", X)
+        # Translate the change in pose in the inertial frame
+        # to get the pose of the next body frame (expressed in I).
+        X[:3,:,i+1] =  del_states_I.transpose(1,0) + X[:3,:,i]
+
+        # Add the initial velocity to the change in velocity to
+        # get the velocity at the next frame expr. in the current frame. 
+        next_vel_Bi = output.squeeze(0)[:,3:] + X[3:,:,i].transpose(0,1)
+
+        # Rotate the next velocity from Bi to I and then to Bf.
+        next_vel_I = body_to_inertial(
+            X[:3,:,i].transpose(1,0),  # orientation at t of Bi relative to I
+            next_vel_Bi # velocity of Bf relative to I expressed in Bi 
+        )
+        next_vel_Bf = inertial_to_body(
+            X[:3,:,i+1].transpose(1,0),  # orientation at t+1 of Bf relative to I
+            next_vel_I,    # (K, 3) matrix of vectors in the inertial frame
+        )
+
+        # Update the velocity of the next frame (expressed in next frame).
+        X[3:,:,i+1] = next_vel_Bf.transpose(1,0)
 
     # print("[DEBUG]: Double Check the final shape of X")       
     # print("X after = ", X.shape)
+    # Correct the angle.
+    # X_np = output.squeeze(0).cpu().numpy()
+    # plt.scatter(X_np[:,0], X_np[:,1], c='blue', alpha=0.6, edgecolors='k')
+    # plt.xlabel("X-axis")
+    # plt.ylabel("Y-axis")
+    # plt.title("Scatter Plot of del_states_I final time")
+    # plt.grid(True)
+    # plt.xlim(-0.03, 0.1)
+    # plt.ylim(-0.06, 0.03)
+    # plt.savefig(f'text-{round(timepkg.time()*1e6)}.png')
+    # plt.clf()
+
+    # Wrap the angles to between -pi and pi.
+    X[2,:,:] = wrap_to_pi(X[2,:,:])
 
     # Flatten the trajectories to a list in ROW major order so
     # that it is easy to unpack into an ArrayFire Array in C++. 
@@ -195,6 +250,59 @@ def dummy(input):
     dx3 = 2.0 + torch.zeros_like(x).unsqueeze(0)
     output = torch.cat((dx1,dx2,dx3), 0).transpose(1,0).unsqueeze(0)
     return output  
+
+def wrap_to_pi(theta):
+    return (theta + torch.pi) % (2 * torch.pi) - torch.pi
+
+def body_to_inertial(
+        bIMat,    # (K, 3) matrix of body frame origin vectors in the inertial frame
+        xBMat,    # (K, 3) matrix of vectors in the body frame
+):
+    """ Transforms body frame vectors into the inertial frame. """
+
+    # Extract the rotation angles. Ensure separate memory by cloning.
+    yaws = bIMat[:,2].clone()  
+
+    cos_yaw = torch.cos(yaws)
+    sin_yaw = torch.sin(yaws)
+    zeros = torch.zeros(yaws.shape[0], device=device)
+    ones = torch.ones(yaws.shape[0], device=device)
+
+    # Construct the batch of rotation matrices
+    R = torch.stack([
+        torch.stack([cos_yaw, -sin_yaw, zeros], dim=1),
+        torch.stack([sin_yaw, cos_yaw, zeros], dim=1),
+        torch.stack([zeros, zeros, ones], dim=1)
+    ], dim=1)  # Shape: (K, 3, 3)
+
+    # Perform batch matrix-vector multiplication
+    xIMat = torch.bmm(R, xBMat.unsqueeze(-1)).squeeze(-1) #+ bIMat # Shape: (N, 3)
+    return xIMat
+
+def inertial_to_body(
+        bIMat,    # (K, 3) matrix of body frame origin vectors in the inertial frame
+        xIMat,    # (K, 3) matrix of vectors in the inertial frame
+):
+    """ Transforms inertial frame vectors into the body frame. """
+
+    # Extract the rotation angles. Ensure separate memory by cloning.
+    yaws = bIMat[:,2].clone()  
+
+    cos_yaw = torch.cos(yaws)
+    sin_yaw = torch.sin(yaws)
+    zeros = torch.zeros(yaws.shape[0], device=device)
+    ones = torch.ones(yaws.shape[0], device=device)
+
+    # Construct the batch of rotation matrices
+    R = torch.stack([
+        torch.stack([cos_yaw, sin_yaw, zeros], dim=1),
+        torch.stack([-sin_yaw, cos_yaw, zeros], dim=1),
+        torch.stack([zeros, zeros, ones], dim=1)
+    ], dim=1)  # Shape: (K, 3, 3)
+
+    # Perform batch matrix-vector multiplication
+    xBMat = torch.bmm(R, xIMat.unsqueeze(-1)).squeeze(-1) #+ bIMat # Shape: (N, 3)
+    return xBMat
 
 
 if __name__ == "__main__":
