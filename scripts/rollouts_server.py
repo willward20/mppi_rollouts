@@ -5,74 +5,61 @@ import os
 import rospy
 import sys
 import torch
-import time as timepkg
 from mppi_rollouts.srv import MppiRollouts, MppiRolloutsResponse
-import matplotlib.pyplot as plt
-from sklearn.metrics.pairwise import rbf_kernel, polynomial_kernel, linear_kernel
-from functools import partial
+from terrain_adaptation.data.load_data import load_scenes, PhoenixDataset
+from terrain_adaptation.models.neural_ode import load_model as load_model_ode
+from terrain_adaptation.models.function_encoder import load_model as load_model_fe
 
-# Add path to the FunctionEncoder package.
 home = os.path.expanduser('~')
-sys.path.append(f'{home}/FunctionEncoderMPPI')
-from FunctionEncoder import FunctionEncoder, WarthogDataset, WarthogDatasetFull2D
 
-# create a dataset
-data_path = f"{home}/catkin_ws/src/mppi_rollouts/data/2025-03-22-10-35-47"
-odom_path = f"{data_path}/warty-odom_processed_full2D-20Hz-CLEAN.csv"
-cmdvel_path = f"{data_path}/warty-cmd_vel-CLEAN.csv"
-dataset = WarthogDatasetFull2D(
-    odom_csv = odom_path, 
-    cmdvel_csv = cmdvel_path,
-    n_examples = 1000
+# Load all scene data as a dictionary
+indices = [1]
+scene_data = load_scenes(indices)
+
+# Get the scene the robot is deployed on
+inputs = [scene_data[f"scene{i}"][0] for i in indices]
+targets = [scene_data[f"scene{i}"][1] for i in indices]
+
+dataset = PhoenixDataset(
+    inputs, targets, n_example_points=100, n_points=1000
 )
+dataloader = torch.utils.data.DataLoader(dataset, batch_size=1)
+dataloader_iter = iter(dataloader)
 
-# Create a Function Encoder model. 
+# Load the model.
+model_type = "function_encoder" # neural_ode or function_encoder
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = FunctionEncoder(
-    input_size=dataset.input_size,  # del_time, states (yaw), controls (lin x, ang z vel)
-    output_size=dataset.output_size, # next states (x, y, yaw)
-    data_type=dataset.data_type,
-    n_basis=11,
-    model_type="FE_NeuralODE",
-    method="least_squares",
-    use_residuals_method=False
-).to(device)
+path = f'{home}/function-encoder-terrain-adaptation/{model_type}_model_interp_extrap.pth'
 
-# Load pre-trained weights into the model. 
-path = f'{home}/FunctionEncoderMPPI/logs/warthog_example/least_squares/shared_model'
-model.load_state_dict(torch.load(f'{path}/2025-04-01_15-26-52_FE_NeuralODE/model.pth'))
+if model_type == "neural_ode":
+    model = load_model_ode(
+        device = device,
+        path = path
+    )
+elif model_type == "function_encoder":
+    model = load_model_fe(
+        device = device,
+        path = path
+    )
 
-# Sample data
-example_xs, example_ys, _, _, _ = dataset.sample()
-# Compute the coefficients for the function encoder using new data. 
-with torch.no_grad():
-    coeff, _ = model.compute_representation(example_xs, example_ys, method="least_squares")
+if model_type == "function_encoder":
+    # Get a batch of data.
+    batch = next(dataloader_iter)
+
+    # Compute the coefficients.
+    xs, dt, ys, example_xs, example_dt, example_ys = batch
+    xs = xs.to(device)
+    dt = dt.to(device)
+    ys = ys.to(device)
+    example_xs = example_xs.to(device)
+    example_dt = example_dt.to(device)
+    example_ys = example_ys.to(device)
+    coefficients, _ = model.compute_coefficients((example_xs, example_dt), example_ys)
+
+# print("done")
+# exit()
 
 
-# New kernel stuff
-# train_data = dataset.train_data.cpu() # 90% of data
-# test_data = dataset.test_data.cpu() # 10% of data
-
-# X = train_data[:,:6]
-# Y = train_data[:,6:]
-
-# sigma = 0.2
-# gamma = 1/ (2 * sigma ** 2)
-# kernel = partial(rbf_kernel, gamma=gamma)
-# Gx = kernel(X, X)
-# G = Gx
-
-# G[np.diag_indices_from(G)] += 1e-6
-
-# G_inv = np.linalg.inv(G)
-
-# def ker_model(x):
-#     kx = kernel(X, x)
-
-#     k = kx
-
-#     pred = Y.T @ G_inv @ k
-#     return pred
 
 
 def handle_calc_rollouts(req):
@@ -111,16 +98,12 @@ def handle_calc_rollouts(req):
     # print("Tensor U: ", U)
     # print("U shape: ", U.shape)
 
-    # if (T == 0) {
-    #     return tile(moddims(x0, 1, 1, N), K);
-    # }
-
     # Define output tensor size to align with ArrayFire expectations. 
     X = torch.zeros((req.N, req.K, req.T + 1), dtype=torch.float32, device=device)
 
     # Define a tensor with integration steps for each rollout.
     time = torch.tensor([[req.dT]], device=device)
-    time = time.repeat(1, req.K) 
+    time = time.repeat(1, req.K)
 
     # Remove the previous control from the sequence.
     V = U[:, :, 1:]
@@ -149,33 +132,30 @@ def handle_calc_rollouts(req):
         # Zero out the position and heading states in x0.
         zeros = torch.zeros(3, X.shape[1], device=device)
         # Concatenate all of the inputs.
-        input = torch.cat((time, zeros, X[3:,:,i], V[:,:,i]), 0) # only use vels
-        # if i == 0:
-            # print("[DEBUG]: Concatenated Input Tensor")
-            # print("input: ", input)
-            # print("input: ", input.shape)
-
+        input = torch.cat((zeros, X[3:,:,i], V[:,:,i]), 0) # only use vels
         # Transpose the inputs to be compatible w/ FEs
         input = input.transpose(0,1).unsqueeze(0)
         # if i == 0:
-            # print("[DEBUG]: Transposed Input Tensor")
-            # print("input: ", input)
-            # print("input: ", input.shape)
+        #     print("[DEBUG]: Transposed Concatenated Input Tensor")
+        #     print("input: ", input)
+        #     print("input: ", input.shape)
         
         # Predict the change in pose (expressed in the body frame) and
         # the velocity of the next body frame. 
         with torch.no_grad():
-            output = model.predict(input, coeff)
-            # output = bicycle(input)
+            if model_type == "function_encoder":
+                output = model((input, time), coefficients=coefficients) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
+            elif model_type == "neural_ode":
+                output = model((input, time))
+
+            # output = model.predict(input, coeff) # for function encoder models
+            # output = model.model.forward(input).squeeze(-1) # for singal network models
+            # print(output.shape)
             # if i == 0:
             #     print("[DEBUG]: Output Tensor")
             #     print("output: ", output.shape)
             #     print("output: ", output.shape)
             #     print("output.squeeze(0).transpose(1,0): ", output.squeeze(0).transpose(1,0))
-
-            # try using the kernel model
-            # output = ker_model(torch.cat((time, X[3:,:,i], V[:,:,i])).transpose(1,0).cpu()).cuda().transpose(1,0).unsqueeze(0)
-            # print("output: ", output.shape)
 
         # Transform the change in pose from the initial body frame
         # to the inertial frame.  
@@ -207,17 +187,6 @@ def handle_calc_rollouts(req):
 
     # print("[DEBUG]: Double Check the final shape of X")       
     # print("X after = ", X.shape)
-    # Correct the angle.
-    # X_np = output.squeeze(0).cpu().numpy()
-    # plt.scatter(X_np[:,0], X_np[:,1], c='blue', alpha=0.6, edgecolors='k')
-    # plt.xlabel("X-axis")
-    # plt.ylabel("Y-axis")
-    # plt.title("Scatter Plot of del_states_I final time")
-    # plt.grid(True)
-    # plt.xlim(-0.03, 0.1)
-    # plt.ylim(-0.06, 0.03)
-    # plt.savefig(f'text-{round(timepkg.time()*1e6)}.png')
-    # plt.clf()
 
     # Wrap the angles to between -pi and pi.
     X[2,:,:] = wrap_to_pi(X[2,:,:])
@@ -229,27 +198,8 @@ def handle_calc_rollouts(req):
     # print("[DEBUG]: Check that the tensor was flattened correctly")
     # print("X_flat: ", X_flat)
     # print("-----------------------")
-    return MppiRolloutsResponse(X_flat)
+    return MppiRolloutsResponse(X_flat)  
 
-def bicycle(input):
-    """Same algorithm used in Phoenix to calculate skid_steer rollouts."""
-    inputT = input[0].transpose(0,1)
-    T, x, y, yaw, xvel, zvel = inputT
-    dx1 = (xvel*torch.cos(yaw)*T).unsqueeze(0)
-    dx2 = (xvel*torch.sin(yaw)*T).unsqueeze(0)
-    dx3 = (zvel*T).unsqueeze(0)
-    output = torch.cat((dx1,dx2,dx3), 0).transpose(1,0).unsqueeze(0)
-    return output  
-
-def dummy(input):
-    """Used to debug the rollouts. Let's you set change in states to constant."""
-    inputT = input[0].transpose(0,1)
-    T, x, y, yaw, xvel, zvel = inputT
-    dx1 = 0.0 + torch.zeros_like(x).unsqueeze(0)
-    dx2 = 0.0 + torch.zeros_like(x).unsqueeze(0)
-    dx3 = 2.0 + torch.zeros_like(x).unsqueeze(0)
-    output = torch.cat((dx1,dx2,dx3), 0).transpose(1,0).unsqueeze(0)
-    return output  
 
 def wrap_to_pi(theta):
     return (theta + torch.pi) % (2 * torch.pi) - torch.pi
