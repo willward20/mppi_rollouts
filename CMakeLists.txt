@@ -183,7 +183,7 @@ target_link_libraries(talker
 # )
 
 # Python scripts for running/testing the MPPI rollouts server.
-catkin_install_python(PROGRAMS scripts/rollouts_server.py scripts/rollouts_server2.py scripts/rollouts_client.py
+catkin_install_python(PROGRAMS scripts/rollouts_server.py scripts/rollouts_client.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
