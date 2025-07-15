@@ -4,8 +4,8 @@ import codecs
 import csv
 import os
 import threading
+import datetime
 import time
-import matplotlib.pyplot as plt
 import numpy as np
 import rospy
 import torch
@@ -29,9 +29,10 @@ class GlobalState:
         self.input_vel_B = torch.zeros(1,3, device=device)
         self.cmd = torch.zeros(2, device=device)
         self.first_cmd_received = False
-        self.baseline_err = []
-        self.baseline1_err = []
+        self.ice_model_err = []
+        self.pave_model_err = []
         self.rls_err = []
+        self.time_array = []
 
 def rosmsg_error_handler(error):
     print("[ERROR]: ", error)
@@ -121,7 +122,7 @@ def handle_calc_rollouts(req):
     with gs.lock:
         # Use the coefficients from the global state.
         coeffs = gs.coefficients.clone()
-        # coeffs = baseline_coefficients.clone()
+        # coeffs = ice_coefficients.clone()
 
     # Convert x0 and U into torch tensors. Make sure that the 
     # elements of U are loaded into the tensor correctly (so 
@@ -274,19 +275,23 @@ def rls_update(data):
 
                 # Compute the recursive least squares prediction error
                 pred = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=gs.coefficients)
-                
+            
+            # Compute the RLS error. 
             loss_rls = torch.nn.functional.mse_loss(pred, y_step)
             gs.rls_err.append(loss_rls.item())
 
             # Compute the baseline prediction error
-            pred_baseline = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=baseline_coefficients)
-            loss_baseline = torch.nn.functional.mse_loss(pred_baseline, y_step)
-            gs.baseline_err.append(loss_baseline.item())
+            pred_ice_model = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=ice_coefficients)
+            loss_ice_model = torch.nn.functional.mse_loss(pred_ice_model, y_step)
+            gs.ice_model_err.append(loss_ice_model.item())
 
             # Compute the baseline prediction error
-            pred_baseline1 = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=baseline_coefficients1)
-            loss_baseline1 = torch.nn.functional.mse_loss(pred_baseline1, y_step)
-            gs.baseline1_err.append(loss_baseline1.item())
+            pred_pave_model = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=pave_coefficients)
+            loss_pave_model = torch.nn.functional.mse_loss(pred_pave_model, y_step)
+            gs.pave_model_err.append(loss_pave_model.item())
+
+            # Record the target time (time of prediction)
+            gs.time_array.append(target_time)
 
     # Save the new state and control for the next iteration.
     gs.input_time = target_time
@@ -317,8 +322,8 @@ def rls_update(data):
 codecs.register_error("rosmsg", rosmsg_error_handler)
 
 # Create two dataloaders
-dataloader_iter0 = make_dataloader([0])
-dataloader_iter1 = make_dataloader([1])
+dataloader_pave = make_dataloader([0])
+dataloader_ice = make_dataloader([1])
 
 # Load the model.
 home = os.path.expanduser('~')
@@ -327,8 +332,8 @@ path = f'{home}/terrain-adaptation-rls/logs/function_encoder/seed=0/function_enc
 model = load_model_fe(device = device, path = path)
 
 # Get baseline coefficients
-baseline_coefficients, _ = get_coefficients(dataloader_iter0, model, device)
-baseline_coefficients1, _ = get_coefficients(dataloader_iter1, model, device)
+ice_coefficients, _ = get_coefficients(dataloader_ice, model, device)
+pave_coefficients, _ = get_coefficients(dataloader_pave, model, device)
 
 # Initialize the global object to track information. 
 gs = GlobalState(device) 
@@ -350,21 +355,21 @@ if __name__ == "__main__":
     finally:
 
         # Define CSV filename
-        csv_path = "phoenix_rls_errors.csv"
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        csv_path = f"src/mppi_rollouts/_data/ICRA_phoenix_adaptation_experiments/phoenix_rls_errors_{timestamp}.csv"
 
         # Pad shorter lists with NaNs to align lengths
-        max_len = max(len(gs.baseline_err), len(gs.baseline1_err), len(gs.rls_err))
+        max_len = max(len(gs.time_array), len(gs.ice_model_err), len(gs.pave_model_err), len(gs.rls_err))
         def pad(lst): return lst + [float('nan')] * (max_len - len(lst))
 
         rows = zip(
-            pad(gs.baseline_err),
-            pad(gs.baseline1_err),
+            pad(gs.time_array),
+            pad(gs.ice_model_err),
+            pad(gs.pave_model_err),
             pad(gs.rls_err),
         )
 
         with open(csv_path, mode='w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["baseline_err", "baseline1_err", "rls_err"])
+            writer.writerow(["time_array", "ice_model_err", "pave_model_err", "rls_err"])
             writer.writerows(rows)
-
-        rospy.loginfo(f"Saved prediction error data to {csv_path}")
