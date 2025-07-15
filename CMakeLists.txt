@@ -54,6 +54,7 @@ add_message_files(
   FILES
   OdomProcessed.msg
   OdomProcessedFull2D.msg
+  OdomCmdVelProcessedFull2D.msg
 )
 
 ## Generate services in the 'srv' folder
@@ -143,6 +144,7 @@ include_directories(
 # C++ code to convert /warty/odom messages to processed messages. 
 add_executable(odom_processor src/odom_processor.cpp)
 add_executable(odom_processor_full2D src/odom_processor_full2D.cpp)
+add_executable(odom_cmd_vel_processor_full2D src/odom_cmd_vel_processor_full2D.cpp)
 add_executable(talker src/talker.cpp)
 
 ## Rename C++ executable without prefix
@@ -161,6 +163,9 @@ target_link_libraries(odom_processor
   ${catkin_LIBRARIES}
 )
 target_link_libraries(odom_processor_full2D
+  ${catkin_LIBRARIES}
+)
+target_link_libraries(odom_cmd_vel_processor_full2D
   ${catkin_LIBRARIES}
 )
 target_link_libraries(talker
@@ -183,7 +188,7 @@ target_link_libraries(talker
 # )
 
 # Python scripts for running/testing the MPPI rollouts server.
-catkin_install_python(PROGRAMS scripts/rollouts_server.py scripts/rollouts_client.py
+catkin_install_python(PROGRAMS scripts/rollouts_server.py scripts/rollouts_client.py scripts/rollouts_server_rls.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

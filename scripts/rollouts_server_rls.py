@@ -1,66 +1,108 @@
 #!/usr/bin/env python3
 
-import numpy as np
+import codecs
+import csv
 import os
+import threading
+import time
+import matplotlib.pyplot as plt
+import numpy as np
 import rospy
-import sys
 import torch
+from torch.utils.data import DataLoader
+
+from mppi_rollouts.msg import OdomCmdVelProcessedFull2D
 from mppi_rollouts.srv import MppiRollouts, MppiRolloutsResponse
-from terrain_adaptation.data.load_data import load_scenes, PhoenixDataset
-from terrain_adaptation.models.neural_ode import load_model as load_model_ode
-from terrain_adaptation.models.function_encoder import load_model as load_model_fe
 
-home = os.path.expanduser('~')
+from function_encoder.coefficients import recursive_least_squares_update
+from terrain_adaptation_rls.data.load_data import load_scenes, PhoenixDataset
+from terrain_adaptation_rls.models.function_encoder import load_model as load_model_fe
 
-# Load all scene data as a dictionary
-indices = [1]
-scene_data = load_scenes(indices)
 
-# Get the scene the robot is deployed on
-inputs = [scene_data[f"scene{i}"][0] for i in indices]
-targets = [scene_data[f"scene{i}"][1] for i in indices]
+class GlobalState:
+    def __init__(self, device):
+        self.lock = threading.Lock()
+        self.coefficients = torch.zeros(1, 8, device=device)
+        self.P = torch.eye(8, device=device).unsqueeze(0)
+        self.input_time = time.time()
+        self.input_pose_I = torch.zeros((1,3), device=device)
+        self.input_vel_B = torch.zeros(1,3, device=device)
+        self.cmd = torch.zeros(2, device=device)
+        self.first_cmd_received = False
+        self.baseline_err = []
+        self.baseline1_err = []
+        self.rls_err = []
 
-dataset = PhoenixDataset(
-    inputs, targets, n_example_points=100, n_points=1000
-)
-dataloader = torch.utils.data.DataLoader(dataset, batch_size=1)
-dataloader_iter = iter(dataloader)
+def rosmsg_error_handler(error):
+    print("[ERROR]: ", error)
+    return ('', error.end)
 
-# Load the model.
-model_type = "function_encoder" # neural_ode or function_encoder
-device = "cuda" if torch.cuda.is_available() else "cpu"
-path = f'{home}/function-encoder-terrain-adaptation/{model_type}_model_interp_extrap.pth'
+def make_dataloader(indices, n_example_points=100, n_points=1000):
+    scene_data = load_scenes(indices)
+    inputs = [scene_data[f"scene{i}"][0] for i in indices]
+    targets = [scene_data[f"scene{i}"][1] for i in indices]
+    dataset = PhoenixDataset(inputs, targets, n_example_points, n_points)
+    return iter(DataLoader(dataset, batch_size=1))
 
-if model_type == "neural_ode":
-    model = load_model_ode(
-        device = device,
-        path = path
-    )
-elif model_type == "function_encoder":
-    model = load_model_fe(
-        device = device,
-        path = path
-    )
-
-if model_type == "function_encoder":
-    # Get a batch of data.
-    batch = next(dataloader_iter)
-
-    # Compute the coefficients.
-    xs, dt, ys, example_xs, example_dt, example_ys = batch
-    xs = xs.to(device)
-    dt = dt.to(device)
-    ys = ys.to(device)
+def get_coefficients(dataloader_iter, model, device):
+    _, _, _, example_xs, example_dt, example_ys = next(dataloader_iter)
     example_xs = example_xs.to(device)
     example_dt = example_dt.to(device)
     example_ys = example_ys.to(device)
-    coefficients, _ = model.compute_coefficients((example_xs, example_dt), example_ys)
+    return model.compute_coefficients((example_xs, example_dt), example_ys)
 
-# print("done")
-# exit()
+def wrap_to_pi(theta):
+    return (theta + torch.pi) % (2 * torch.pi) - torch.pi
 
+def body_to_inertial(
+        bIMat,    # (K, 3) matrix of body frame origin vectors in the inertial frame
+        xBMat,    # (K, 3) matrix of vectors in the body frame
+):
+    """ Transforms body frame vectors into the inertial frame. """
 
+    # Extract the rotation angles. Ensure separate memory by cloning.
+    yaws = bIMat[:,2].clone()  
 
+    c = torch.cos(yaws)
+    s = torch.sin(yaws)
+    zeros = torch.zeros(yaws.shape[0], device=device)
+    ones = torch.ones(yaws.shape[0], device=device)
+
+    # Construct the batch of rotation matrices
+    R = torch.stack([
+        torch.stack([c, -s, zeros], dim=1),
+        torch.stack([s, c, zeros], dim=1),
+        torch.stack([zeros, zeros, ones], dim=1)
+    ], dim=1)  # Shape: (K, 3, 3)
+
+    # Perform batch matrix-vector multiplication
+    xIMat = torch.bmm(R, xBMat.unsqueeze(-1)).squeeze(-1) #+ bIMat # Shape: (N, 3)
+    return xIMat
+
+def inertial_to_body(
+        bIMat,    # (K, 3) matrix of body frame origin vectors in the inertial frame
+        xIMat,    # (K, 3) matrix of vectors in the inertial frame
+):
+    """ Transforms inertial frame vectors into the body frame. """
+
+    # Extract the rotation angles. Ensure separate memory by cloning.
+    yaws = bIMat[:,2].clone()  
+
+    c = torch.cos(yaws)
+    s = torch.sin(yaws)
+    zeros = torch.zeros(yaws.shape[0], device=device)
+    ones = torch.ones(yaws.shape[0], device=device)
+
+    # Construct the batch of rotation matrices
+    R = torch.stack([
+        torch.stack([c, s, zeros], dim=1),
+        torch.stack([-s, c, zeros], dim=1),
+        torch.stack([zeros, zeros, ones], dim=1)
+    ], dim=1)  # Shape: (K, 3, 3)
+
+    # Perform batch matrix-vector multiplication
+    xBMat = torch.bmm(R, xIMat.unsqueeze(-1)).squeeze(-1) #+ bIMat # Shape: (N, 3)
+    return xBMat
 
 def handle_calc_rollouts(req):
     """ Calculates rollouts for MPPI. 
@@ -75,28 +117,17 @@ def handle_calc_rollouts(req):
         OUTPUTS:
             X = list encoder a (req.K, req.T+1. N) array. 
     """
-    # print("[DEBUG]: Function Inputs") 
-    # print("dT: ", req.dT)
-    # print("K: ", req.K)
-    # print("T: ", req.T)
-    # print("M: ", req.M)
-    # print("N: ", req.N)
-    # print("len(x0): ", len(req.x0))
-    # print("len(U): ", len(req.U))
-    # print("-----")
 
+    with gs.lock:
+        # Use the coefficients from the global state.
+        coeffs = gs.coefficients.clone()
+        # coeffs = baseline_coefficients.clone()
 
     # Convert x0 and U into torch tensors. Make sure that the 
     # elements of U are loaded into the tensor correctly (so 
     # that the tensor matches the ArrayFire array in C++).
     x0 = torch.tensor(req.x0, dtype=torch.float32, device=device)
     U = torch.tensor(req.U, dtype=torch.float32, device=device).reshape(req.M, req.T+1, req.K).transpose(1, 2)
-
-    # print("[DEBUG]: Lists Converted to Tensors")
-    # print("Tensor x0: ", x0)
-    # print("x0 shape: ", x0.shape)
-    # print("Tensor U: ", U)
-    # print("U shape: ", U.shape)
 
     # Define output tensor size to align with ArrayFire expectations. 
     X = torch.zeros((req.N, req.K, req.T + 1), dtype=torch.float32, device=device)
@@ -107,25 +138,11 @@ def handle_calc_rollouts(req):
 
     # Remove the previous control from the sequence.
     V = U[:, :, 1:]
-
-    # print("[DEBUG]: Tensor Sizes for X, V, and time")
-    # print("X: ", X.shape)
-    # print("time: ", time.shape)
-    # print("V: ", V.shape)
-    # print("V: ", V)
     
     # Set initial state across all samples at t=0. Assign 
     # the initial state of each sample along X. 
     x0_reshaped = x0.reshape(req.N, 1, 1) 
     X[:, :, 0] = x0_reshaped.repeat(1, req.K, 1).squeeze(2) 
-
-    # print("[DEBUG]: Setting the Initial States")
-    # print("x0_reshaped: ", x0_reshaped)
-    # print("x0_reshaped: ", x0_reshaped.shape)
-    # print("x0_reshaped_repeated: ", x0_reshaped.repeat(1, req.K, 1))
-    # print("x0_reshaped_repeated: ", x0_reshaped.repeat(1, req.K, 1).shape)
-    # print("x0_reshaped_repeated_squeezed: ", x0_reshaped.repeat(1, req.K, 1).squeeze(2))
-    # print("X with init cond: ", X)
     
     # Integrate over time. 
     for i in range(req.T):
@@ -135,27 +152,11 @@ def handle_calc_rollouts(req):
         input = torch.cat((zeros, X[3:,:,i], V[:,:,i]), 0) # only use vels
         # Transpose the inputs to be compatible w/ FEs
         input = input.transpose(0,1).unsqueeze(0)
-        # if i == 0:
-        #     print("[DEBUG]: Transposed Concatenated Input Tensor")
-        #     print("input: ", input)
-        #     print("input: ", input.shape)
         
         # Predict the change in pose (expressed in the body frame) and
         # the velocity of the next body frame. 
         with torch.no_grad():
-            if model_type == "function_encoder":
-                output = model((input, time), coefficients=coefficients) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
-            elif model_type == "neural_ode":
-                output = model((input, time))
-
-            # output = model.predict(input, coeff) # for function encoder models
-            # output = model.model.forward(input).squeeze(-1) # for singal network models
-            # print(output.shape)
-            # if i == 0:
-            #     print("[DEBUG]: Output Tensor")
-            #     print("output: ", output.shape)
-            #     print("output: ", output.shape)
-            #     print("output.squeeze(0).transpose(1,0): ", output.squeeze(0).transpose(1,0))
+            output = model((input, time), coefficients=coeffs) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
 
         # Transform the change in pose from the initial body frame
         # to the inertial frame.  
@@ -185,74 +186,152 @@ def handle_calc_rollouts(req):
         # Update the velocity of the next frame (expressed in next frame).
         X[3:,:,i+1] = next_vel_Bf.transpose(1,0)
 
-    # print("[DEBUG]: Double Check the final shape of X")       
-    # print("X after = ", X.shape)
-
     # Wrap the angles to between -pi and pi.
     X[2,:,:] = wrap_to_pi(X[2,:,:])
 
     # Flatten the trajectories to a list in ROW major order so
     # that it is easy to unpack into an ArrayFire Array in C++. 
     X_flat = X.permute(0, 2, 1).contiguous().flatten().tolist()
-
-    # print("[DEBUG]: Check that the tensor was flattened correctly")
-    # print("X_flat: ", X_flat)
-    # print("-----------------------")
     return MppiRolloutsResponse(X_flat)  
 
 
-def wrap_to_pi(theta):
-    return (theta + torch.pi) % (2 * torch.pi) - torch.pi
+def rls_update(data):
+    # print("[DEBUG]: Received a new command velocity for RLS update")
 
-def body_to_inertial(
-        bIMat,    # (K, 3) matrix of body frame origin vectors in the inertial frame
-        xBMat,    # (K, 3) matrix of vectors in the body frame
-):
-    """ Transforms body frame vectors into the inertial frame. """
+    # Unpack the data from the message (these are the targets). 
+    target_time = data.time
+    target_xPos = data.xPos
+    target_yPos = data.yPos
+    target_yaw = np.unwrap([gs.input_pose_I.cpu()[:,2].item(), data.yaw])[1]
+    target_xVel = data.xVel
+    target_yVel = data.yVel
+    target_zAngVel = data.zAngVel
 
-    # Extract the rotation angles. Ensure separate memory by cloning.
-    yaws = bIMat[:,2].clone()  
+    # Maintain a certain framerate.
+    del_t = target_time - gs.input_time
 
-    cos_yaw = torch.cos(yaws)
-    sin_yaw = torch.sin(yaws)
-    zeros = torch.zeros(yaws.shape[0], device=device)
-    ones = torch.ones(yaws.shape[0], device=device)
+    # Make sure you have two points to process. 
+    if gs.first_cmd_received:
 
-    # Construct the batch of rotation matrices
-    R = torch.stack([
-        torch.stack([cos_yaw, -sin_yaw, zeros], dim=1),
-        torch.stack([sin_yaw, cos_yaw, zeros], dim=1),
-        torch.stack([zeros, zeros, ones], dim=1)
-    ], dim=1)  # Shape: (K, 3, 3)
+        # Build x_step tensor from the previous states.
+        x_step = torch.cat(
+            (torch.zeros_like(gs.input_vel_B), gs.input_vel_B),  # Previous velocity in body frame
+            dim=-1
+        ).unsqueeze(0)
 
-    # Perform batch matrix-vector multiplication
-    xIMat = torch.bmm(R, xBMat.unsqueeze(-1)).squeeze(-1) #+ bIMat # Shape: (N, 3)
-    return xIMat
+        # Build the u_step vector from the previous controls.
+        u_step = torch.tensor(
+            [gs.input_cmd_xVel, gs.input_cmd_zAngVel],dtype=torch.float32, device=device
+        ).unsqueeze(0).unsqueeze(0)
 
-def inertial_to_body(
-        bIMat,    # (K, 3) matrix of body frame origin vectors in the inertial frame
-        xIMat,    # (K, 3) matrix of vectors in the inertial frame
-):
-    """ Transforms inertial frame vectors into the body frame. """
+        # Build the dt_step tensor from the time difference.
+        dt_step = torch.tensor(
+            [del_t], dtype=torch.float32, device=device
+        ).unsqueeze(0)
 
-    # Extract the rotation angles. Ensure separate memory by cloning.
-    yaws = bIMat[:,2].clone()  
+        # Set the target pose and velocity tensors.
+        target_pose_I = torch.tensor(
+            [target_xPos, target_yPos, target_yaw], dtype=torch.float32, device=device
+        ).unsqueeze(0)
 
-    cos_yaw = torch.cos(yaws)
-    sin_yaw = torch.sin(yaws)
-    zeros = torch.zeros(yaws.shape[0], device=device)
-    ones = torch.ones(yaws.shape[0], device=device)
+        # Transform the target positions into the body frame of the previous state.
+        target_del_pose_B = inertial_to_body(
+            gs.input_pose_I,  target_pose_I - gs.input_pose_I
+        )
 
-    # Construct the batch of rotation matrices
-    R = torch.stack([
-        torch.stack([cos_yaw, sin_yaw, zeros], dim=1),
-        torch.stack([-sin_yaw, cos_yaw, zeros], dim=1),
-        torch.stack([zeros, zeros, ones], dim=1)
-    ], dim=1)  # Shape: (K, 3, 3)
+        # Transform the target velocities into the body frame of the previous state.
+        target_vel_B = body_to_inertial(
+            target_pose_I, 
+            torch.tensor(
+                [target_xVel, target_yVel, target_zAngVel], 
+                dtype=torch.float32, device=device
+            ).unsqueeze(0)   # xBMat
+        )
+        target_vel_B = inertial_to_body(gs.input_pose_I, target_vel_B)
 
-    # Perform batch matrix-vector multiplication
-    xBMat = torch.bmm(R, xIMat.unsqueeze(-1)).squeeze(-1) #+ bIMat # Shape: (N, 3)
-    return xBMat
+        # Build the y_step tensor (change in pose and vel) from the target.
+        y_step = torch.cat(
+            (target_del_pose_B, target_vel_B - gs.input_vel_B), dim=-1
+        ).unsqueeze(0)
+
+        with torch.no_grad():
+
+            # Compute the basis functions 
+            # [batch_size, n_points, n_features, n_basis]
+            g = model.basis_functions((torch.cat((x_step,u_step), dim=-1), dt_step))
+
+            L = torch.linalg.cholesky(gs.P)
+
+            with gs.lock:
+                gs.coefficients, gs.P = recursive_least_squares_update(
+                    method='qr',
+                    g=g,
+                    y=y_step,
+                    P=L,
+                    coefficients=gs.coefficients,
+                    forgetting_factor=0.95,
+                )
+
+                # Compute the recursive least squares prediction error
+                pred = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=gs.coefficients)
+                
+            loss_rls = torch.nn.functional.mse_loss(pred, y_step)
+            gs.rls_err.append(loss_rls.item())
+
+            # Compute the baseline prediction error
+            pred_baseline = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=baseline_coefficients)
+            loss_baseline = torch.nn.functional.mse_loss(pred_baseline, y_step)
+            gs.baseline_err.append(loss_baseline.item())
+
+            # Compute the baseline prediction error
+            pred_baseline1 = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=baseline_coefficients1)
+            loss_baseline1 = torch.nn.functional.mse_loss(pred_baseline1, y_step)
+            gs.baseline1_err.append(loss_baseline1.item())
+
+    # Save the new state and control for the next iteration.
+    gs.input_time = target_time
+    gs.input_pose_I = torch.tensor(
+        [
+            data.xPos, 
+            data.yPos, 
+            np.unwrap([data.yaw])[0]
+        ], 
+        dtype=torch.float32, device=device
+    ).unsqueeze(0)
+    
+    gs.input_vel_B = torch.tensor(
+        [data.xVel, data.yVel, data.zAngVel], 
+        dtype=torch.float32, device=device
+    ).unsqueeze(0)
+    
+    gs.input_cmd_xVel = data.cmd_xVel
+    gs.input_cmd_zAngVel = data.cmd_zAngVel
+
+    # Set the flag to true
+    gs.first_cmd_received = True
+
+
+
+
+# Register the 'rosmsg' error handler
+codecs.register_error("rosmsg", rosmsg_error_handler)
+
+# Create two dataloaders
+dataloader_iter0 = make_dataloader([0])
+dataloader_iter1 = make_dataloader([1])
+
+# Load the model.
+home = os.path.expanduser('~')
+device = "cuda" if torch.cuda.is_available() else "cpu"
+path = f'{home}/terrain-adaptation-rls/logs/function_encoder/seed=0/function_encoder_model.pth'
+model = load_model_fe(device = device, path = path)
+
+# Get baseline coefficients
+baseline_coefficients, _ = get_coefficients(dataloader_iter0, model, device)
+baseline_coefficients1, _ = get_coefficients(dataloader_iter1, model, device)
+
+# Initialize the global object to track information. 
+gs = GlobalState(device) 
 
 
 if __name__ == "__main__":
@@ -260,4 +339,32 @@ if __name__ == "__main__":
     rospy.init_node('rollouts_server')
     service = rospy.Service('warty/calc_rollouts', MppiRollouts, handle_calc_rollouts)
     rospy.loginfo("Service 'calc_rollouts' ready to calculate MPPI rollouts.")
-    rospy.spin()
+
+    # Initialize a ROS subscriber.
+    rospy.Subscriber('warty/odom_cmd_vel_processed_full2D', OdomCmdVelProcessedFull2D, rls_update)
+
+    try:
+        rospy.spin()
+    except KeyboardInterrupt:
+        rospy.loginfo("Shutting down rollouts server due to keyboard interrupt.")
+    finally:
+
+        # Define CSV filename
+        csv_path = "phoenix_rls_errors.csv"
+
+        # Pad shorter lists with NaNs to align lengths
+        max_len = max(len(gs.baseline_err), len(gs.baseline1_err), len(gs.rls_err))
+        def pad(lst): return lst + [float('nan')] * (max_len - len(lst))
+
+        rows = zip(
+            pad(gs.baseline_err),
+            pad(gs.baseline1_err),
+            pad(gs.rls_err),
+        )
+
+        with open(csv_path, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["baseline_err", "baseline1_err", "rls_err"])
+            writer.writerows(rows)
+
+        rospy.loginfo(f"Saved prediction error data to {csv_path}")

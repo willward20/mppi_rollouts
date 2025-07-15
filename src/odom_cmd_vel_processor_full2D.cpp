@@ -13,8 +13,8 @@ public:
     OdomCmdVelProcessor()
     {
         // Initialize subscriber and publisher
-        odom_sub_ = nh_.subscribe("/warty/odom", 10, &OdomCmdVelProcessor::odomCallback, this);
-        cmd_vel_sub_ = nh_.subscribe("/warty/cmd_vel", 10, &OdomCmdVelProcessor::cmdVelCallback, this);
+        odom_sub_ = nh_.subscribe("/warty/odom/throttled", 10, &OdomCmdVelProcessor::odomCallback, this);
+        cmd_vel_sub_ = nh_.subscribe("/warty/cmd_vel/throttled", 10, &OdomCmdVelProcessor::cmdVelCallback, this);
         odom_cmd_vel_pub_ = nh_.advertise<mppi_rollouts::OdomCmdVelProcessedFull2D>("/warty/odom_cmd_vel_processed_full2D", 10);
         
         // Initialize command velocity
