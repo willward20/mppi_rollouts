@@ -163,7 +163,7 @@ def handle_calc_rollouts(req):
         # Predict the change in pose (expressed in the body frame) and
         # the velocity of the next body frame. 
         with torch.no_grad():
-            output = model((input, times), coefficients=coeffs) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
+            output = fe_model((input, times), coefficients=coeffs) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
 
         # Transform the change in pose from the initial body frame
         # to the inertial frame.  
@@ -266,7 +266,7 @@ def rls_update(data):
 
             # Compute the basis functions 
             # [batch_size, n_points, n_features, n_basis]
-            g = model.basis_functions((torch.cat((x_step,u_step), dim=-1), dt_step))
+            g = fe_model.basis_functions((torch.cat((x_step,u_step), dim=-1), dt_step))
 
             L = torch.linalg.cholesky(gs.P)
 
@@ -281,7 +281,7 @@ def rls_update(data):
                 )
 
                 # Compute the recursive least squares prediction error
-                pred = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=gs.coefficients)
+                pred = fe_model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=gs.coefficients)
             
             # Compute the RLS error. 
             loss_rls = torch.nn.functional.mse_loss(pred, y_step)
@@ -293,7 +293,7 @@ def rls_update(data):
             gs.node_err.append(loss_node_model.item())
 
             # Compute the baseline prediction error for static real coeffs.
-            pred_fe_model = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=static_coefficients)
+            pred_fe_model = fe_model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=static_coefficients)
             loss_fe_model = torch.nn.functional.mse_loss(pred_fe_model, y_step)
             gs.fe_err.append(loss_fe_model.item())
 
@@ -323,34 +323,9 @@ def rls_update(data):
     gs.first_cmd_received = True
 
 
-
-
-# Register the 'rosmsg' error handler
-codecs.register_error("rosmsg", rosmsg_error_handler)
-
-# Create two dataloaders
-dataloader_pave = make_dataloader([0])
-dataloader_ice = make_dataloader([1])
-
-# Load the model.
-home = os.path.expanduser('~')
-device = "cuda" if torch.cuda.is_available() else "cpu"
-path = f'{home}/terrain-adaptation-rls/logs/jackal_0770/grass_gym_ice23-15/function_encoder/seed=42/hidden_size=16/function_encoder_model.pth'
-model = load_model_fe(device = device, path = path, n_basis=8, hidden_size=16) 
-
-# Load a baseline neural ODE model.
-node_path = f'{home}/terrain-adaptation-rls/logs/neural_ode_model.pth'
-node_model = load_model_node(device = device, path = node_path)
-
-# Get baseline coefficients
-ice_coefficients, _ = get_coefficients(dataloader_ice, model, device)
-pave_coefficients, _ = get_coefficients(dataloader_pave, model, device)
-
-# Get coeffs from the historical trajectories.
-def make_hardware_dataloader(n_example_points=100, n_points=1000):
+def make_hardware_dataloader(data_path, n_example_points=100, n_points=1000):
 
     # Load data as CSV
-    data_path = f"{home}/terrain-adaptation-rls/logs/jackal_0770/gym-floor-2/function_encoder/seed=42/jackal_0770_gym-floor2"
     test_inputs_np = load_csv(f"{data_path}/test_input.csv")
     test_targets_np = load_csv(f"{data_path}/test_target.csv")
 
@@ -372,11 +347,40 @@ def load_csv(full_path):
     return np.array(data)
 
 
-dataloader_real = make_hardware_dataloader()
-static_coefficients, _ = get_coefficients(dataloader_real, model, device)
+
+
+# =========================== SETUP ======================================
+
+# Choose (1) the FE model, (2) the NODE model, (3) the baseline coeff data
+home = os.path.expanduser('~')
+fe_path = f'{home}/terrain-adaptation-rls/logs/jackal_0770/grass_gym_ice23-15/function_encoder/seed=42/hidden_size=16/function_encoder_model.pth'
+node_path = f'{home}/terrain-adaptation-rls/logs/jackal_0770/grass_gym_ice23-15/neural_ode/seed=42/hidden_size=16/neural_ode_model.pth'
+data_path = f"{home}/terrain-adaptation-rls/logs/jackal_0770/gym-floor-2/function_encoder/seed=42/jackal_0770_gym-floor2"
+
+# Register the 'rosmsg' error handler
+codecs.register_error("rosmsg", rosmsg_error_handler)
+
+# Load the FE and NODE models.
+device = "cuda" if torch.cuda.is_available() else "cpu"
+fe_model = load_model_fe(device = device, path = fe_path, n_basis=8, hidden_size=16) 
+node_model = load_model_node(device = device, path = node_path, hidden_size=16)
+
+# Get coeffs from the historical trajectories.
+dataloader_real = make_hardware_dataloader(data_path=data_path)
+static_coefficients, _ = get_coefficients(dataloader_real, fe_model, device)
 
 # Initialize the global object to track information. 
 gs = GlobalState(device) 
+
+
+
+# Create two dataloaders for simulated data
+dataloader_pave = make_dataloader([0])
+dataloader_ice = make_dataloader([1])
+
+# Get baseline coefficients for simulated data
+ice_coefficients, _ = get_coefficients(dataloader_ice, fe_model, device)
+pave_coefficients, _ = get_coefficients(dataloader_pave, fe_model, device)
 
 
 if __name__ == "__main__":
@@ -391,7 +395,7 @@ if __name__ == "__main__":
     rospy.loginfo("Service 'calc_rollouts' ready to calculate MPPI rollouts.")
 
     # Initialize a ROS subscriber.
-    rospy.Subscriber(f'{name}/odom_cmd_vel_processed_full2D', OdomCmdVelProcessedFull2D, rls_update)
+    # rospy.Subscriber(f'{name}/odom_cmd_vel_processed_full2D', OdomCmdVelProcessedFull2D, rls_update)
 
     try:
         rospy.spin()
