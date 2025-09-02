@@ -10,12 +10,17 @@
 class OdomCmdVelProcessor
 {
 public:
-    OdomCmdVelProcessor()
+    OdomCmdVelProcessor(const std::string& name)
     {
+        // Build topic names dynamically
+        std::string odom_topic = "/" + name + "/odom/throttled";
+        std::string cmd_vel_topic = "/" + name + "/cmd_vel/throttled";
+        std::string out_topic = "/" + name + "/odom_cmd_vel_processed_full2D";
+
         // Initialize subscriber and publisher
-        odom_sub_ = nh_.subscribe("/warty/odom/throttled", 10, &OdomCmdVelProcessor::odomCallback, this);
-        cmd_vel_sub_ = nh_.subscribe("/warty/cmd_vel/throttled", 10, &OdomCmdVelProcessor::cmdVelCallback, this);
-        odom_cmd_vel_pub_ = nh_.advertise<mppi_rollouts::OdomCmdVelProcessedFull2D>("/warty/odom_cmd_vel_processed_full2D", 10);
+        odom_sub_ = nh_.subscribe(odom_topic, 10, &OdomCmdVelProcessor::odomCallback, this);
+        cmd_vel_sub_ = nh_.subscribe(cmd_vel_topic, 10, &OdomCmdVelProcessor::cmdVelCallback, this);
+        odom_cmd_vel_pub_ = nh_.advertise<mppi_rollouts::OdomCmdVelProcessedFull2D>(out_topic, 10);
         
         // Initialize command velocity
         latest_cmd_vel_.linear.x = 0.0;
@@ -34,7 +39,7 @@ private:
     void odomCallback(const nav_msgs::Odometry::ConstPtr& odom)
     {
         // Debug
-        ROS_INFO("Received odometry message at time: %f", odom->header.stamp.toSec());
+        // ROS_INFO("Received odometry message at time: %f", odom->header.stamp.toSec());
         
         // Declare a ROS message for the processed odometry. 
         mppi_rollouts::OdomCmdVelProcessedFull2D processed_odom_cmd_vel;
@@ -71,7 +76,13 @@ private:
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "odom_cmd_vel_processor");
-    OdomCmdVelProcessor processor;
+    ros::NodeHandle private_nh("~");
+
+    // Get name parameter (default "warty")
+    std::string name;
+    private_nh.param<std::string>("name", name, "jackal_0770");
+
+    OdomCmdVelProcessor processor(name);
     ros::spin();
     return 0;
 }

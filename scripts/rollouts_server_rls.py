@@ -17,6 +17,7 @@ from mppi_rollouts.srv import MppiRollouts, MppiRolloutsResponse
 from function_encoder.coefficients import recursive_least_squares_update
 from terrain_adaptation_rls.data.load_data import load_scenes, PhoenixDataset
 from terrain_adaptation_rls.models.function_encoder import load_model as load_model_fe
+from terrain_adaptation_rls.models.neural_ode import load_model as load_model_node
 
 
 class GlobalState:
@@ -29,8 +30,9 @@ class GlobalState:
         self.input_vel_B = torch.zeros(1,3, device=device)
         self.cmd = torch.zeros(2, device=device)
         self.first_cmd_received = False
-        self.ice_model_err = []
-        self.pave_model_err = []
+
+        self.node_err = []
+        self.fe_err = []
         self.rls_err = []
         self.time_array = []
 
@@ -118,11 +120,15 @@ def handle_calc_rollouts(req):
         OUTPUTS:
             X = list encoder a (req.K, req.T+1. N) array. 
     """
+    # print("[DEBUG]: Rollouts requested")
+    start_time = time.time()
 
     with gs.lock:
         # Use the coefficients from the global state.
         coeffs = gs.coefficients.clone()
-        # coeffs = ice_coefficients.clone()
+
+        # Use static coefficients computed from offline data.
+        # coeffs = static_coefficients.clone()
 
     # Convert x0 and U into torch tensors. Make sure that the 
     # elements of U are loaded into the tensor correctly (so 
@@ -134,8 +140,8 @@ def handle_calc_rollouts(req):
     X = torch.zeros((req.N, req.K, req.T + 1), dtype=torch.float32, device=device)
 
     # Define a tensor with integration steps for each rollout.
-    time = torch.tensor([[req.dT]], device=device)
-    time = time.repeat(1, req.K)
+    times = torch.tensor([[req.dT]], device=device)
+    times = times.repeat(1, req.K)
 
     # Remove the previous control from the sequence.
     V = U[:, :, 1:]
@@ -157,7 +163,7 @@ def handle_calc_rollouts(req):
         # Predict the change in pose (expressed in the body frame) and
         # the velocity of the next body frame. 
         with torch.no_grad():
-            output = model((input, time), coefficients=coeffs) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
+            output = model((input, times), coefficients=coeffs) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
 
         # Transform the change in pose from the initial body frame
         # to the inertial frame.  
@@ -193,6 +199,7 @@ def handle_calc_rollouts(req):
     # Flatten the trajectories to a list in ROW major order so
     # that it is easy to unpack into an ArrayFire Array in C++. 
     X_flat = X.permute(0, 2, 1).contiguous().flatten().tolist()
+    print(f"[DEBUG]: Rollouts sent {time.time() - start_time} seconds later.")
     return MppiRolloutsResponse(X_flat)  
 
 
@@ -280,15 +287,15 @@ def rls_update(data):
             loss_rls = torch.nn.functional.mse_loss(pred, y_step)
             gs.rls_err.append(loss_rls.item())
 
-            # Compute the baseline prediction error
-            pred_ice_model = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=ice_coefficients)
-            loss_ice_model = torch.nn.functional.mse_loss(pred_ice_model, y_step)
-            gs.ice_model_err.append(loss_ice_model.item())
+            # Compute the baseline prediction error for a neural ODE. 
+            pred_node_model = node_model((torch.cat((x_step, u_step), dim=-1), dt_step))
+            loss_node_model = torch.nn.functional.mse_loss(pred_node_model, y_step)
+            gs.node_err.append(loss_node_model.item())
 
-            # Compute the baseline prediction error
-            pred_pave_model = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=pave_coefficients)
-            loss_pave_model = torch.nn.functional.mse_loss(pred_pave_model, y_step)
-            gs.pave_model_err.append(loss_pave_model.item())
+            # Compute the baseline prediction error for static real coeffs.
+            pred_fe_model = model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=static_coefficients)
+            loss_fe_model = torch.nn.functional.mse_loss(pred_fe_model, y_step)
+            gs.fe_err.append(loss_fe_model.item())
 
             # Record the target time (time of prediction)
             gs.time_array.append(target_time)
@@ -328,25 +335,63 @@ dataloader_ice = make_dataloader([1])
 # Load the model.
 home = os.path.expanduser('~')
 device = "cuda" if torch.cuda.is_available() else "cpu"
-path = f'{home}/terrain-adaptation-rls/logs/function_encoder/seed=0/function_encoder_model.pth'
-model = load_model_fe(device = device, path = path)
+path = f'{home}/terrain-adaptation-rls/logs/jackal_0770/grass_gym_ice23-15/function_encoder/seed=42/hidden_size=16/function_encoder_model.pth'
+model = load_model_fe(device = device, path = path, n_basis=8, hidden_size=16) 
+
+# Load a baseline neural ODE model.
+node_path = f'{home}/terrain-adaptation-rls/logs/neural_ode_model.pth'
+node_model = load_model_node(device = device, path = node_path)
 
 # Get baseline coefficients
 ice_coefficients, _ = get_coefficients(dataloader_ice, model, device)
 pave_coefficients, _ = get_coefficients(dataloader_pave, model, device)
+
+# Get coeffs from the historical trajectories.
+def make_hardware_dataloader(n_example_points=100, n_points=1000):
+
+    # Load data as CSV
+    data_path = f"{home}/terrain-adaptation-rls/logs/jackal_0770/gym-floor-2/function_encoder/seed=42/jackal_0770_gym-floor2"
+    test_inputs_np = load_csv(f"{data_path}/test_input.csv")
+    test_targets_np = load_csv(f"{data_path}/test_target.csv")
+
+    # Convert to torch tensor
+    test_inputs = [torch.from_numpy(test_inputs_np).float()]
+    test_targets = [torch.from_numpy(test_targets_np).float()]
+
+    # Build the dataloader.
+    dataset = PhoenixDataset(test_inputs, test_targets, n_example_points, n_points)
+    return iter(DataLoader(dataset, batch_size=1))
+
+def load_csv(full_path):
+    data = []
+    with open(full_path, "r") as f:
+        reader = csv.reader(f)
+        next(reader)  # Skip the header row
+        for row in reader:
+            data.append([float(x) for x in row])
+    return np.array(data)
+
+
+dataloader_real = make_hardware_dataloader()
+static_coefficients, _ = get_coefficients(dataloader_real, model, device)
 
 # Initialize the global object to track information. 
 gs = GlobalState(device) 
 
 
 if __name__ == "__main__":
-    # Initialize the ROS server.
+    # Initialize the ROS node.
     rospy.init_node('rollouts_server')
-    service = rospy.Service('warty/calc_rollouts', MppiRollouts, handle_calc_rollouts)
+
+    # Get robot name from a private parameter (default: "warty")
+    name = rospy.get_param("~name", "jackal_0770")
+
+    # Start the rollouts service.
+    service = rospy.Service(f'{name}/calc_rollouts', MppiRollouts, handle_calc_rollouts)
     rospy.loginfo("Service 'calc_rollouts' ready to calculate MPPI rollouts.")
 
     # Initialize a ROS subscriber.
-    rospy.Subscriber('warty/odom_cmd_vel_processed_full2D', OdomCmdVelProcessedFull2D, rls_update)
+    rospy.Subscriber(f'{name}/odom_cmd_vel_processed_full2D', OdomCmdVelProcessedFull2D, rls_update)
 
     try:
         rospy.spin()
@@ -356,20 +401,20 @@ if __name__ == "__main__":
 
         # Define CSV filename
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        csv_path = f"src/mppi_rollouts/_data/ICRA_phoenix_adaptation_experiments/phoenix_rls_errors_{timestamp}.csv"
+        csv_path = f"{home}/ws/src/mppi_rollouts/_data/jackal_0770_rls_errors_{timestamp}.csv"
 
         # Pad shorter lists with NaNs to align lengths
-        max_len = max(len(gs.time_array), len(gs.ice_model_err), len(gs.pave_model_err), len(gs.rls_err))
+        max_len = max(len(gs.time_array), len(gs.rls_err), len(gs.node_err), len(gs.fe_err))
         def pad(lst): return lst + [float('nan')] * (max_len - len(lst))
 
         rows = zip(
             pad(gs.time_array),
-            pad(gs.ice_model_err),
-            pad(gs.pave_model_err),
             pad(gs.rls_err),
+            pad(gs.node_err),
+            pad(gs.fe_err),
         )
 
         with open(csv_path, mode='w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["time_array", "ice_model_err", "pave_model_err", "rls_err"])
+            writer.writerow(["time_array", "rls_err", "node_err", "fe_err"])
             writer.writerows(rows)
