@@ -269,14 +269,14 @@ def rls_update(data):
                 gs.coefficients = coeffs
 
             # Compute the recursive least squares prediction error
-            # pred = fe_model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=coeffs)
+            pred = fe_model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=coeffs)
             
             # # Compute the RLS error. 
-            # loss_rls = torch.nn.functional.mse_loss(pred, y_step)
-            # gs.rls_err.append(loss_rls.item())
+            loss_rls = torch.nn.functional.mse_loss(pred, y_step)
+            gs.rls_err.append(loss_rls.item())
 
             # # Record the target time (time of prediction)
-            # gs.time_array.append(target_time)
+            gs.time_array.append(target_time)
 
     # Save the new state and control for the next iteration.
     gs.input_time = target_time

@@ -195,7 +195,7 @@ def handle_calc_rollouts(req):
 
 
 def maml_update(data):
-    # print("[DEBUG]: Received a new command velocity for RLS update")
+    print("[DEBUG]: Received a new command velocity for RLS update")
     start_time = time.time()
 
     # Unpack the data from the message (these are the targets). 
@@ -327,9 +327,11 @@ inner_steps = 1
 
 # Load the MAML model.
 home = os.path.expanduser('~')
+n_basis = 5
+hidden_size = 32
 device = "cuda" #"cuda" if torch.cuda.is_available() else "cpu"
-maml_path = f'{home}/terrain-adaptation-rls/logs/jackal_0770/grass_gym_ice23-15/maml/seed=0/maml_model.pth'
-maml_model = load_model_maml(device = device, path = maml_path)
+maml_path = f'{home}/terrain-adaptation-rls/logs/grass_gym_ice_mulch_pavement_turf/maml/seed=42/n_basis={n_basis}/hidden_size={hidden_size}/maml_model.pth'
+maml_model = load_model_maml(device = device, path = maml_path, n_basis=n_basis, hidden_size=hidden_size)
 gs = GlobalState(maml_model, device)
 
 
@@ -355,7 +357,13 @@ if __name__ == "__main__":
 
         # Define CSV filename
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        csv_path = f"{home}/ws/src/mppi_rollouts/_data/jackal_0770_maml_errors_{timestamp}.csv"
+        csv_path = f"{home}/ws/src/mppi_rollouts/ice_autonomy_data/maml_errors/n_basis={n_basis}_hidden_size={hidden_size}"
+
+        # Create the directory path if it doesn't exist
+        os.makedirs(csv_path, exist_ok=True)
+
+        # Build full filename
+        file_path = os.path.join(csv_path, f"{timestamp}.csv")
 
         # Pad shorter lists with NaNs to align lengths
         max_len = max(len(gs.time_array), len(gs.maml_err),)
@@ -363,7 +371,7 @@ if __name__ == "__main__":
 
         rows = zip(
             pad(gs.time_array),
-            pad(gs.rls_err),
+            pad(gs.maml_err),
         )
 
         with open(csv_path, mode='w', newline='') as f:

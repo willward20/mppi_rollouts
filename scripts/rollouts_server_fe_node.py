@@ -216,7 +216,7 @@ def load_csv(full_path):
 
 # Choose (1) the FE model, (2) the NODE model, (3) the baseline coeff data
 home = os.path.expanduser('~')
-model_name = 'NODE'
+model_name = 'FE'
 n_basis = 3
 hidden_size = 16
 fe_path = f'{home}/terrain-adaptation-rls/logs/grass_gym_ice_mulch_pavement_turf/function_encoder/seed=42/n_basis={n_basis}/hidden_size={hidden_size}/function_encoder_model.pth'
